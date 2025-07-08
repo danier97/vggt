@@ -164,3 +164,161 @@ def closed_form_inverse_se3(se3, R=None, T=None):
     inverted_matrix[:, :3, 3:] = top_right
 
     return inverted_matrix
+
+
+def unproject_depth_map_to_point_map_batched_frames(
+    depth_map: torch.Tensor, extrinsics_cam: torch.Tensor, intrinsics_cam: torch.Tensor
+) -> torch.Tensor:
+    """
+    Unproject a batch of depth maps with sequence frames to 3D world coordinates.
+
+    Args:
+        depth_map (torch.Tensor): Batch of depth maps of shape (B, S, H, W, 1) or (B, S, H, W)
+        extrinsics_cam (torch.Tensor): Batch of camera extrinsic matrices of shape (B, S, 3, 4)
+        intrinsics_cam (torch.Tensor): Batch of camera intrinsic matrices of shape (B, S, 3, 3)
+
+    Returns:
+        torch.Tensor: Batch of 3D world coordinates of shape (B, S, H, W, 3)
+    """
+    if not isinstance(depth_map, torch.Tensor):
+        depth_map = torch.from_numpy(depth_map)
+    if not isinstance(extrinsics_cam, torch.Tensor):
+        extrinsics_cam = torch.from_numpy(extrinsics_cam)
+    if not isinstance(intrinsics_cam, torch.Tensor):
+        intrinsics_cam = torch.from_numpy(intrinsics_cam)
+
+    device = depth_map.device
+    extrinsics_cam = extrinsics_cam.to(device)
+    intrinsics_cam = intrinsics_cam.to(device)
+
+    B, S, H, W = depth_map.shape[:4]
+
+    # Reshape all inputs to (B*S, ...)
+    if depth_map.dim() == 5 and depth_map.shape[-1] == 1:
+        depth_map = depth_map.squeeze(-1) # (B, S, H, W)
+    
+    depth_map_flat = depth_map.view(B * S, H, W)
+    extrinsics_cam_flat = extrinsics_cam.view(B * S, 3, 4)
+    intrinsics_cam_flat = intrinsics_cam.view(B * S, 3, 3)
+
+    # Perform the core unprojection operation on the flattened tensors
+    world_coords_points_flat, _, _ = depth_to_world_coords_points_batched_frames(
+        depth_map_flat, extrinsics_cam_flat, intrinsics_cam_flat
+    )
+
+    # Reshape back to (B, S, H, W, 3)
+    world_coords_points = world_coords_points_flat.view(B, S, H, W, 3)
+    return world_coords_points
+
+
+def depth_to_world_coords_points_batched_frames(
+    depth_map: torch.Tensor,
+    extrinsic: torch.Tensor,
+    intrinsic: torch.Tensor,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Convert a batch of depth maps (where batch includes sequence dim) to world coordinates.
+
+    Args:
+        depth_map (torch.Tensor): Batch of depth maps of shape (B_eff, H, W).
+        extrinsic (torch.Tensor): Batch of camera extrinsic matrices of shape (B_eff, 3, 4).
+        intrinsic (torch.Tensor): Batch of camera intrinsic matrices of shape (B_eff, 3, 3).
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]: World coordinates (B_eff, H, W, 3),
+        camera coordinates (B_eff, H, W, 3), and valid depth mask (B_eff, H, W).
+    """
+    if depth_map is None:
+        return None, None, None
+
+    point_mask = depth_map > eps
+
+    cam_coords_points = depth_to_cam_coords_points_batched_frames(depth_map, intrinsic)
+
+    # extrinsic is (B_eff, 3, 4), closed_form_inverse_se3 expects (N, 3, 4) or (N, 4, 4)
+    cam_to_world_extrinsic = closed_form_inverse_se3_batched_frames(extrinsic)
+
+    R_cam_to_world = cam_to_world_extrinsic[:, :3, :3] # (B_eff, 3, 3)
+    t_cam_to_world = cam_to_world_extrinsic[:, :3, 3:] # (B_eff, 3, 1)
+
+    # (B_eff, H, W, 3) @ (B_eff, 3, 3) -> (B_eff, H, W, 3)
+    world_coords_points = torch.matmul(cam_coords_points, R_cam_to_world.transpose(-1, -2)) + t_cam_to_world.squeeze(-1).unsqueeze(1).unsqueeze(1)
+
+    return world_coords_points, cam_coords_points, point_mask
+
+
+def depth_to_cam_coords_points_batched_frames(depth_map: torch.Tensor, intrinsic: torch.Tensor) -> torch.Tensor:
+    """
+    Convert a batch of depth maps (where batch includes sequence dim) to camera coordinates.
+
+    Args:
+        depth_map (torch.Tensor): Batch of depth maps of shape (B_eff, H, W).
+        intrinsic (torch.Tensor): Batch of camera intrinsic matrices of shape (B_eff, 3, 3).
+
+    Returns:
+        torch.Tensor: Camera coordinates (B_eff, H, W, 3)
+    """
+    B_eff, H, W = depth_map.shape
+    device = depth_map.device
+
+    # Handle intrinsic being (3,3) for all batch-frames if provided
+    if intrinsic.dim() == 2:
+        intrinsic = intrinsic.unsqueeze(0).expand(B_eff, -1, -1)
+
+    fu = intrinsic[:, 0, 0].view(B_eff, 1, 1)
+    fv = intrinsic[:, 1, 1].view(B_eff, 1, 1)
+    cu = intrinsic[:, 0, 2].view(B_eff, 1, 1)
+    cv = intrinsic[:, 1, 2].view(B_eff, 1, 1)
+
+    u_grid, v_grid = torch.meshgrid(torch.arange(W, device=device), torch.arange(H, device=device), indexing='xy')
+    u_grid = u_grid.float().unsqueeze(0) # (1, H, W)
+    v_grid = v_grid.float().unsqueeze(0) # (1, H, W)
+
+    x_cam = (u_grid - cu) * depth_map / fu
+    y_cam = (v_grid - cv) * depth_map / fv
+    z_cam = depth_map
+
+    cam_coords = torch.stack((x_cam, y_cam, z_cam), dim=-1).to(torch.float32)
+
+    return cam_coords
+
+
+def closed_form_inverse_se3_batched_frames(se3: torch.Tensor, R: torch.Tensor = None, T: torch.Tensor = None) -> torch.Tensor:
+    """
+    Compute the inverse of each 4x4 (or 3x4) SE3 matrix in a batch (where batch includes sequence dim).
+
+    Args:
+        se3 (torch.Tensor): Batch of SE3 matrices of shape (B_eff, 4, 4) or (B_eff, 3, 4).
+        R (torch.Tensor, optional): Batch of rotation matrices of shape (B_eff, 3, 3).
+        T (torch.Tensor, optional): Batch of translation vectors of shape (B_eff, 3, 1).
+
+    Returns:
+        torch.Tensor: Inverted SE3 matrices of shape (B_eff, 4, 4).
+    """
+    if not isinstance(se3, torch.Tensor):
+        se3 = torch.from_numpy(se3)
+
+    if se3.shape[-2:] != (4, 4) and se3.shape[-2:] != (3, 4):
+        raise ValueError(f"se3 must be of shape (B_eff,4,4) or (B_eff,3,4), got {se3.shape}.")
+
+    if R is None:
+        R = se3[:, :3, :3]
+    if T is None:
+        T = se3[:, :3, 3:]
+
+    R_transposed = R.transpose(-1, -2)
+    top_right = -torch.bmm(R_transposed, T)
+
+    inverted_matrix = torch.eye(4, 4, dtype=se3.dtype, device=se3.device).unsqueeze(0).repeat(se3.shape[0], 1, 1)
+
+    inverted_matrix[:, :3, :3] = R_transposed
+    inverted_matrix[:, :3, 3:] = top_right
+
+    return inverted_matrix
+
+def get_grid(H,W):
+    u_grid, v_grid = torch.meshgrid(torch.arange(W), torch.arange(H), indexing='xy')
+    u_grid = u_grid.float().unsqueeze(0) # (1, H, W)
+    v_grid = v_grid.float().unsqueeze(0) # (1, H, W)
+    return torch.stack((u_grid, v_grid), dim=-1)  # (1, H, W, 2)
