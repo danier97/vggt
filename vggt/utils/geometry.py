@@ -7,7 +7,7 @@
 import os
 import torch
 import numpy as np
-
+from einops import rearrange
 
 def unproject_depth_map_to_point_map(
     depth_map: np.ndarray, extrinsics_cam: np.ndarray, intrinsics_cam: np.ndarray
@@ -243,7 +243,10 @@ def depth_to_world_coords_points_batched_frames(
     t_cam_to_world = cam_to_world_extrinsic[:, :3, 3:] # (B_eff, 3, 1)
 
     # (B_eff, H, W, 3) @ (B_eff, 3, 3) -> (B_eff, H, W, 3)
-    world_coords_points = torch.matmul(cam_coords_points, R_cam_to_world.transpose(-1, -2)) + t_cam_to_world.squeeze(-1).unsqueeze(1).unsqueeze(1)
+    _, h, w, _ = cam_coords_points.shape
+    cam_coords_points = rearrange(cam_coords_points, 'b h w c -> b (h w) c')
+    world_coords_points = torch.matmul(cam_coords_points, R_cam_to_world.transpose(-1, -2)) + t_cam_to_world.squeeze(-1).unsqueeze(1)
+    world_coords_points = rearrange(world_coords_points, 'b (h w) c -> b h w c', h=h, w=w)
 
     return world_coords_points, cam_coords_points, point_mask
 
